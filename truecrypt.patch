@@ -1,0 +1,506 @@
+Index: Common/Common.h
+===================================================================
+--- Common/Common.h	(revision 2)
++++ Common/Common.h	(working copy)
+@@ -72,4 +72,65 @@
+ 	BOOL RecoveryMode;
+ } MountOptions;
+ 
++// <Modif>
++
++/**
++ * Taille, en octets, de la signature SHA
++ */
++#define NOT_USED_SECTORS_SHA_SIZE 32
++
++/**
++ * ID du message du thread à la fenêtre principale qui prévient du démarrage de la vérification des secteurs non utilisés
++ */
++#define START_NOT_USED_SECTORS_CHECK 9998
++
++/**
++ * ID du message du thread à la fenêtre principale qui provient de la fin de la vérification des secteurs non utilisés
++ */
++#define END_NOT_USED_SECTORS_CHECK 9999
++
++/**
++ * Description d'une zone de secteurs non utilisés dans une partition sur un disque ou périphérique.
++ */
++typedef struct 
++{
++	char *devicePath;				//Le chemin de la partition
++	uint64 startOffset;				//Offset de début de la zone 
++	uint64 areaSize;				//Taille, en octets, de la zone
++} NotUsedArea;
++
++/**
++ * Signature SHA256 d'une zone non utilis�e.
++ */
++typedef struct
++{
++	NotUsedArea area;				//Zone des données
++	unsigned char hash[NOT_USED_SECTORS_SHA_SIZE];			//Hash SHA256
++} NotUsedAreaSign;
++
++/**
++ * Permet de créer une instance de la structure NotUsedArea et de l'ajouter à un vecteur nommé "areas".
++ */
++#define ADD_AREA(a, b, c) \
++ 	NotUsedArea *newArea = new NotUsedArea(); \
++	newArea->devicePath = new char[strlen(a) + 1]; \
++	strcpy(newArea->devicePath, a); \
++	newArea->startOffset = b; \
++	newArea->areaSize = c; \
++	areas->push_back(*newArea);
++
++/**
++ * Permet de créer une instance de la structure NotUsedAreaSign et de l'ajouter à un vecteur de nommé "areas".
++ */
++#define ADD_AREASIGN(a, b, c, d) \
++	NotUsedAreaSign *areaSign = new NotUsedAreaSign(); \
++	areaSign->area.devicePath = new char[strlen(a) + 1]; \
++	strcpy(areaSign->area.devicePath, a); \
++	areaSign->area.startOffset = b; \
++	areaSign->area.areaSize = c; \
++	memcpy(areaSign->hash, d, NOT_USED_SECTORS_SHA_SIZE); \
++	areas->push_back(*areaSign);
++	
++// </Modif>
++
+ #endif
+Index: Common/Dlgcode.h
+===================================================================
+--- Common/Dlgcode.h	(revision 2)
++++ Common/Dlgcode.h	(working copy)
+@@ -66,6 +66,10 @@
+ 
+ #define MAX_MULTI_CHOICES		10		/* Maximum number of options for mutliple-choice dialog */
+ 
++// <Modif>
++#define TC_APPD_FILENAME_NOT_USED_SECTORS_SIGN				"NotUsedSectorsSign.dat"
++// </Modif>
++
+ #define TC_APPD_FILENAME_CONFIGURATION						"Configuration.xml"
+ #define TC_APPD_FILENAME_SYSTEM_ENCRYPTION					"System Encryption.xml"
+ #define TC_APPD_FILENAME_DEFAULT_KEYFILES					"Default Keyfiles.xml"
+Index: Common/Language.xml
+===================================================================
+--- Common/Language.xml	(revision 2)
++++ Common/Language.xml	(working copy)
+@@ -1276,6 +1276,14 @@
+     <string lang="en" key="TB_PER_SEC">TB/s</string>
+     <string lang="en" key="PB_PER_SEC">PB/s</string>
+     <string lang="en" key="TRIPLE_DOT_GLYPH_ELLIPSIS">…</string>
++    
++    <!-- <Modif> -->
++    <string lang="en" key="NOT_USED_SECTORS_WARNING">Warning : a unused sector has been modified since the last boot. It might be an attack !</string>
++    <string lang="en" key="NOT_USED_SECTORS_CHANGE_SAVE">If you're the cause of this difference, click "YES" to update sectors's signatures.</string>
++    <string lang="en" key="NO_THREAD_CHECK_NOT_USED_SECTORS">Unable to start thread which must check unused sectors.</string>
++    <string lang="en" key="TITLE_CHECK_NOT_USED_SECTORS">Looking for an BootLoader Attack...</string>
++    <!-- </Modif> -->
++    
+   </localization>
+   <!-- XML Schema -->
+   <xs:schema attributeFormDefault="unqualified" elementFormDefault="qualified" xmlns:xs="http://www.w3.org/2001/XMLSchema">
+Index: Mount/Mount.c
+===================================================================
+--- Mount/Mount.c	(revision 2)
++++ Mount/Mount.c	(working copy)
+@@ -20,6 +20,10 @@
+ #include <sys/stat.h>
+ #include <windowsx.h>
+ 
++// <Modif>
++#include <fstream>
++// </Modif>
++
+ #include "Apidrvr.h"
+ #include "BootEncryption.h"
+ #include "Cmdline.h"
+@@ -142,6 +146,317 @@
+ static BOOL CmdLineVolumeSpecified;
+ static int LastDriveListVolumeColumnWidth;
+ 
++// <Modif>
++
++/**
++ * Permet de récupérer toutes les zones non utilisées d'un disque ou d'un périphérique. 
++ * Une zone non utilisée est un ensemble d'octets (arrondi à la taille d'un secteur) qui ne sont pas repris dans une partition.
++ *
++ * @return vecteur contenant des NotUsedArea
++ */
++vector <NotUsedArea> * GetNotUsedSectors(void)
++{
++	//les périphériques
++	vector<HostDevice> devices;
++	devices = GetAvailableHostDevices(false, true, false, true);
++
++	//les zones non utilisées
++	vector<NotUsedArea> *areas = new vector<NotUsedArea>();
++
++	PARTITION_INFORMATION partitionInfo;
++	string currentDiskPath;
++	uint64 currentDiskSize;
++	uint64 currentOffset = 0;
++	
++	foreach(const HostDevice &device, devices)
++	{
++		if(!device.IsPartition) //s'il s'agit d'un disque
++		{
++			if(currentOffset != 0) //à la fin du traitement d'un disque, on vérifie s'il n'y a pas une zone non utilisée à la fin
++			{
++				if(currentOffset < currentDiskSize)
++				{
++					ADD_AREA(currentDiskPath.c_str(), currentOffset, currentDiskSize - currentOffset);
++				}
++			}
++			
++			currentDiskSize = device.Size;
++
++			stringstream sstm;
++			sstm << "PhysicalDrive" << device.SystemNumber;
++			currentDiskPath = sstm.str();
++
++			if(device.Path.compare(BootEncObj->GetSystemDriveConfiguration().DrivePartition.DevicePath) == 0) //si c'est le disque contenant le BootLoader de TrueCrypt, on l'analyse à part
++			{
++				ADD_AREA(currentDiskPath.c_str(), 0, TC_BOOT_LOADER_AREA_SECTOR_COUNT * TC_SECTOR_SIZE_BIOS);
++				currentOffset = TC_BOOT_LOADER_AREA_SECTOR_COUNT * TC_SECTOR_SIZE_BIOS;
++			}
++			else 
++				currentOffset = 0;
++		}
++		else //s'il s'agit d'une partition
++		{
++			//récupération des informations de la partition
++			GetPartitionInfo(device.Path.c_str(), &partitionInfo);
++
++			if(partitionInfo.StartingOffset.QuadPart - currentOffset != 0)
++			{
++				ADD_AREA(currentDiskPath.c_str(), currentOffset, partitionInfo.StartingOffset.QuadPart - currentOffset);
++			}
++
++			currentOffset = partitionInfo.StartingOffset.QuadPart + partitionInfo.PartitionLength.QuadPart;
++		}
++	}
++
++	if(currentOffset < currentDiskSize) //à la fin du traitement d'un disque, on vérifie s'il n'y a pas une zone non utilisée à la fin
++	{
++		ADD_AREA(currentDiskPath.c_str(), currentOffset, currentDiskSize - currentOffset);
++	}
++
++	return areas;
++}
++
++/**
++ * Permet de calculer la signature SHA256 de la zone.
++ *
++ * ATTENTION: si vous changez l'alogrithme utilisé, veuillez réviser la taille de "NOT_USED_SECTORS_SHA_SIZE" dans Mount.h
++ *
++ * @param area la zone non utilisée dont il faut calculer la signature
++ * @return une structure NotUsedAreaSign contenant la signature et la zone signée
++ */
++NotUsedAreaSign NotUsedSectorsSignCompute(NotUsedArea area)
++{
++	//on ouvre la disque directement (sans interprétation du FS)
++	Device device(string(area.devicePath), true);
++
++	byte buffer[TC_SECTOR_SIZE_BIOS];
++	uint64 nbSectors = area.areaSize / TC_SECTOR_SIZE_BIOS;
++	
++	//initialisation de la signature SHA256
++	sha256_ctx ctx;
++	sha256_begin(&ctx);
++
++	//on travaille par secteur
++	for(uint64 i=0; i < nbSectors; i++)
++	{
++		device.SeekAt(area.startOffset + (TC_SECTOR_SIZE_BIOS * i)); //on se positionne au bon endroit
++		device.Read(buffer, TC_SECTOR_SIZE_BIOS);                    //on lit les données
++
++		sha256_hash(buffer, TC_SECTOR_SIZE_BIOS, &ctx);			     //on calcule le hash
++	}
++
++	device.Close(); 
++
++	NotUsedAreaSign areaSign;
++	areaSign.area = area;
++   sha256_end(areaSign.hash, &ctx); //on finalise la signature
++
++	return areaSign;
++}
++
++/**
++ * Permet de calculer toutes les signatures des zones non utilisées.
++ *
++ * @return vecteur contenant des NotUsedAreaSign
++ */
++vector<NotUsedAreaSign> * ComputeNotUsedSectorsSign(void)
++{
++	//les zones
++	vector<NotUsedArea> *areas = GetNotUsedSectors();
++
++	//les zones signées
++	vector<NotUsedAreaSign> *areasSign = new vector<NotUsedAreaSign>();
++
++	for(unsigned int i=0; i < areas->size(); i++)
++	{
++		NotUsedArea area = areas->at(i);
++		areasSign->push_back(NotUsedSectorsSignCompute(area));
++	}
++
++	areas->clear();
++	delete areas;
++
++	return areasSign;
++}
++
++/**
++ * Récupère les informations des zones non utilisées à partir du fichier.
++ *
++ * @return vecteur contenant des NotUsedAreaSign
++ */
++vector<NotUsedAreaSign> * GetSavedNotUsedSectorsSign(void)
++{
++	//vector qui va contenir les informations du fichier
++	vector<NotUsedAreaSign> *areas = new vector<NotUsedAreaSign>();
++	fstream signFile(string(GetConfigPath(TC_APPD_FILENAME_NOT_USED_SECTORS_SIGN)), ios::in | ios::binary);
++
++	char devicePath[255];
++	char hash[NOT_USED_SECTORS_SHA_SIZE];
++	uint64 startOffset;
++	uint64 areaSize;
++
++	//on détermine la taille des données à lire
++	signFile.seekg(0, ios_base::end);
++	streamoff fileSize = signFile.tellp();
++	signFile.seekg(0, ios_base::beg);
++	
++	//tant qu'il y a des enregistrements
++	while(signFile.tellp() < fileSize)
++	{
++		//on nettoie le buffer et on lit la cha�ne représentant le chemin du périphérique
++		memset(devicePath, 0, 255);
++		int pos=-1;
++		do {
++			pos++;
++			signFile.read(devicePath+pos, 1);
++		} while(*(devicePath+pos) != '\0');
++
++		//on lit les tailles et le hash
++		signFile.read((char *) & startOffset, sizeof(uint64));
++		signFile.read((char *) & areaSize, sizeof(uint64));
++		signFile.read(hash, NOT_USED_SECTORS_SHA_SIZE);
++
++		//on ajoute �a au vecteur
++		ADD_AREASIGN(devicePath, startOffset, areaSize, hash);
++	}
++
++	//nettoyage des variables contenant les informations sensibles
++	burn(devicePath, 255);
++	burn(hash, NOT_USED_SECTORS_SHA_SIZE);
++	startOffset = 0;
++	areaSize = 0;
++
++	return areas;
++}
++
++/**
++ * Permet de calculer les signatures courantes des zones non utilisées et de les sauver dans un fichier binaire.
++ */
++void SaveNotUsedSectorsSign(void)
++{
++	vector<NotUsedAreaSign> *currentSign = ComputeNotUsedSectorsSign();
++	fstream signFile(string(GetConfigPath(TC_APPD_FILENAME_NOT_USED_SECTORS_SIGN)), ios::out | ios::binary);
++	for(unsigned int i=0; i < currentSign->size(); i++)
++	{
++		NotUsedAreaSign areaSign = currentSign->at(i);
++
++		signFile.write(areaSign.area.devicePath, (strlen(areaSign.area.devicePath) + 1) * sizeof(char));
++		signFile.write((char *) & areaSign.area.startOffset, sizeof(areaSign.area.startOffset));
++		signFile.write((char *) & areaSign.area.areaSize, sizeof(areaSign.area.areaSize));
++		signFile.write((char *) & areaSign.hash, sizeof(areaSign.hash));
++	}
++
++	signFile.close();
++
++	currentSign->clear();
++	delete currentSign;
++}
++
++/**
++ * Indique si les deux structures sont les mêmes.
++ *
++ * @a la premi�re structure
++ * @b la seconde structure
++ * @return TRUE si les structures sont les mêmes, FALSE sinon
++ */
++BOOL CompareNotUsedAreaSign(NotUsedAreaSign a, NotUsedAreaSign b)
++{
++	return (   memcmp(a.hash, b.hash, NOT_USED_SECTORS_SHA_SIZE) == 0
++			&& strcmp(a.area.devicePath, b.area.devicePath) == 0
++			&& a.area.startOffset == b.area.startOffset
++			&& a.area.areaSize == b.area.areaSize);
++}
++
++/**
++ * Réalise la vérification que les zones non utilisées sur le disque n'ont pas été modifiées depuis le dernier démarrage.
++ * Cette réalisation compare les données et signatures préalablement enregistrées à celles actuelles.
++ * Peut être extrêmement long sur des systêmes avant beaucoup d'espaces non utilisés.
++ */
++void CheckNotUsedAreaSign(void)
++{
++	//on récupère les signatures sauvées
++	vector<NotUsedAreaSign> *savedSign = GetSavedNotUsedSectorsSign();
++
++	//on calcule les signatures actuelles
++	vector<NotUsedAreaSign> *currentSign = ComputeNotUsedSectorsSign();
++
++	unsigned int j;
++	BOOL found;
++
++	//on les compare et on élimine les correspondances
++	for(unsigned int i=0; i < currentSign->size();)
++	{
++		found = FALSE;
++		for(j=0; j < savedSign->size(); j++)
++		{
++			if(CompareNotUsedAreaSign(currentSign->at(i), savedSign->at(j)))
++			{
++				found = TRUE;
++				break;
++			}
++		}
++
++		if(found) //si on trouve une correspondance, on supprime l'occurence car tout est OK
++		{
++			savedSign->erase(savedSign->begin() + j);
++			currentSign->erase(currentSign->begin() + i);
++		}
++		else
++			i++;
++	}
++
++	if(!(currentSign->size() == 0 && savedSign->size() == 0)) //il y a une différence entre les zones sauvées et les zones actuelles
++	{
++		Warning("NOT_USED_SECTORS_WARNING"); //on alerte l'utilisateur
++		
++		if(AskWarnNoYes("NOT_USED_SECTORS_CHANGE_SAVE") == IDYES) //on lui propose de mettre à jour le fichier
++			SaveNotUsedSectorsSign();
++	}
++
++	savedSign->clear();
++	delete savedSign;
++
++	currentSign->clear();
++	delete currentSign;
++}
++
++/**
++ * Thread qui prévient la vue principale du démarrage/arrêt du traitement et réalise la vérification des zones non utilisées.
++ *
++ * @param lpParam le HWND de la fenêtre principale
++ * @return 0 si tout est OK
++ */
++DWORD WINAPI ThreadCheckNotUsedAreaSign(LPVOID lpParam) 
++{
++	//on prévient la fen�tre du début du traitement
++	SendMessage((HWND)lpParam, START_NOT_USED_SECTORS_CHECK, 0, 0);
++
++	//on réalise la vérification
++	CheckNotUsedAreaSign();
++
++	//on prévient la fen�tre de la fin du traitement
++	SendMessage((HWND)lpParam, END_NOT_USED_SECTORS_CHECK, 0, 0);
++
++    return 0; 
++} 
++
++/**
++ * Permet de convertir une chaîne wchar_t* en char*.
++ *
++ * @param wschar la chaîne
++ * @return la chaîne convertie
++ */
++char * ConvertWSCHAR2CHAR(wchar_t *wschar)
++{
++	char *buff = new char[wcslen(wschar) * 2]; //cela semble largement suffisant
++	wcstombs(buff, wschar,  wcslen(wschar));
++	buff[wcslen(wschar)] = '\0';
++
++	return buff;
++}
++
++// </Modif>
++
+ static void localcleanup (void)
+ {
+ 	// Wipe command line
+@@ -5019,8 +5334,42 @@
+ 			DoPostInstallTasks ();
+ 			ResetCurrentDirectory ();
+ 		}
++
++		// <Modif>
++		if(CreateThread(NULL, 0, ThreadCheckNotUsedAreaSign, hwndDlg, 0, NULL) == NULL)
++			AbortProcess("NO_THREAD_CHECK_NOT_USED_SECTORS");
++		// </Modif>
++
+ 		return 0;
+-		
++
++	// <Modif>
++	case START_NOT_USED_SECTORS_CHECK:
++		{
++			char *currentTitle = ConvertWSCHAR2CHAR(lpszTitle);
++			char *titleProcess = ConvertWSCHAR2CHAR(GetString("TITLE_CHECK_NOT_USED_SECTORS"));
++			
++			char *newTitle = new char[(strlen(currentTitle) + strlen(titleProcess) + 3 + 1) * sizeof(char)];
++			strcpy(newTitle, currentTitle);
++			strcat(newTitle, " - ");
++			strcat(newTitle, titleProcess);
++
++			delete [] currentTitle;
++			delete [] titleProcess;
++
++			SetWindowText(hwndDlg, newTitle);
++		}
++
++		return 0;
++
++	case END_NOT_USED_SECTORS_CHECK:
++		{
++			char *newTitle = ConvertWSCHAR2CHAR(lpszTitle);
++			SetWindowText(hwndDlg, newTitle);
++		}
++
++		return 0;
++	// </Modif>
++
+ 	case WM_MOUSEWHEEL:
+ 		return HandleDriveListMouseWheelEvent (uMsg, wParam, lParam, FALSE);
+ 
+Index: Mount/Mount.h
+===================================================================
+--- Mount/Mount.h	(revision 2)
++++ Mount/Mount.h	(working copy)
+@@ -107,6 +107,20 @@
+ #ifdef __cplusplus
+ }
+ 
++// <Modif>
++
++vector <NotUsedArea> * GetNotUsedSectors(void);
++NotUsedAreaSign NotUsedSectorsSignCompute(NotUsedArea area);
++vector<NotUsedAreaSign> * ComputeNotUsedSectorsSign(void);
++vector<NotUsedAreaSign> * GetSavedNotUsedSectorsSign(void);
++void SaveNotUsedSectorsSign(void);
++BOOL CompareNotUsedAreaSign(NotUsedAreaSign a, NotUsedAreaSign b);
++void CheckNotUsedAreaSign(void);
++DWORD WINAPI ThreadCheckNotUsedAreaSign(LPVOID lpParam);
++char * ConvertWSCHAR2CHAR(wchar_t *wschar);
++
++// </Modif>
++
+ void SetDriverConfigurationFlag (uint32 flag, BOOL state);
+ BOOL MountFavoriteVolumes (BOOL systemFavorites = FALSE, BOOL logOnMount = FALSE, BOOL hotKeyMount = FALSE, const TrueCrypt::FavoriteVolume &favoriteVolumeToMount = TrueCrypt::FavoriteVolume());
+ BOOL GetExecutableImageInformation (const string &path, string &version, string &description, string &companyName, string &productName);
