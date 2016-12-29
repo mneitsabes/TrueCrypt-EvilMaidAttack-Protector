@@ -34,7 +34,7 @@ Index: Common/Common.h
 +} NotUsedArea;
 +
 +/**
-+ * Signature SHA256 d'une zone non utilis�e.
++ * Signature SHA256 d'une zone non utilisée.
 + */
 +typedef struct
 +{
@@ -278,7 +278,7 @@ Index: Mount/Mount.c
 +	//tant qu'il y a des enregistrements
 +	while(signFile.tellp() < fileSize)
 +	{
-+		//on nettoie le buffer et on lit la cha�ne représentant le chemin du périphérique
++		//on nettoie le buffer et on lit la chaîne représentant le chemin du périphérique
 +		memset(devicePath, 0, 255);
 +		int pos=-1;
 +		do {
@@ -291,7 +291,7 @@ Index: Mount/Mount.c
 +		signFile.read((char *) & areaSize, sizeof(uint64));
 +		signFile.read(hash, NOT_USED_SECTORS_SHA_SIZE);
 +
-+		//on ajoute �a au vecteur
++		//on ajoute au vecteur
 +		ADD_AREASIGN(devicePath, startOffset, areaSize, hash);
 +	}
 +
@@ -330,7 +330,7 @@ Index: Mount/Mount.c
 +/**
 + * Indique si les deux structures sont les mêmes.
 + *
-+ * @a la premi�re structure
++ * @a la première structure
 + * @b la seconde structure
 + * @return TRUE si les structures sont les mêmes, FALSE sinon
 + */
@@ -403,13 +403,13 @@ Index: Mount/Mount.c
 + */
 +DWORD WINAPI ThreadCheckNotUsedAreaSign(LPVOID lpParam) 
 +{
-+	//on prévient la fen�tre du début du traitement
++	//on prévient la fenêtre du début du traitement
 +	SendMessage((HWND)lpParam, START_NOT_USED_SECTORS_CHECK, 0, 0);
 +
 +	//on réalise la vérification
 +	CheckNotUsedAreaSign();
 +
-+	//on prévient la fen�tre de la fin du traitement
++	//on prévient la fenêtre de la fin du traitement
 +	SendMessage((HWND)lpParam, END_NOT_USED_SECTORS_CHECK, 0, 0);
 +
 +    return 0; 
